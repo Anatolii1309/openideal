@@ -1,0 +1,425 @@
+<?php
+
+/**
+ * @file
+ * Core functions for the Mentions module.
+ */
+
+/**
+ * Include additional files.
+ */
+$dirname  = dirname(__FILE__);
+$includes = file_scan_directory($dirname . "/includes", '/.inc$/');
+foreach (module_list() as $module) {
+  $file = $dirname . "/includes/{$module}.inc";
+  if (isset($includes[$file])) {
+    require_once $file;
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function mentions_permission() {
+  return array(
+    'administer mention types' => array(
+      'title' => t('Administer mention types'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_entity_info().
+ *
+ * @return mixed
+ */
+function mentions_entity_info() {
+  $info['mention'] = array(
+    'label'            => t('Mention'),
+    'entity class'     => 'Mention',
+    'controller class' => 'MentionController',
+    'base table'       => 'mentions',
+    'uri callback'     => 'mentions_uri',
+    'fieldable'        => TRUE,
+    'entity keys'      => array(
+      'id'     => 'mid',
+      'bundle' => 'type',
+      'label'  => 'source_title',
+    ),
+    'bundle keys'      => array(
+      'bundle' => 'type',
+    ),
+    'bundles'          => array(),
+    'module'           => 'mentions',
+    'access callback'  => TRUE,
+  );
+
+  $mentions_types = db_select('mentions_type', 't')->fields('t')->execute();
+  foreach ($mentions_types as $mentions_type) {
+    $info['mention']['bundles'][$mentions_type->type] = array(
+      'label' => $mentions_type->name,
+      'admin' => array(
+        'path'            => 'admin/structure/mentions/manage/%mentions_type',
+        'real path'       => "admin/structure/mentions/manage/{$mentions_type->type}",
+        'bundle argument' => 4,
+      ),
+    );
+  }
+
+  $info['mentions_type'] = array(
+    'label'            => t('Mention type'),
+    'entity class'     => 'MentionsType',
+    'controller class' => 'MentionsTypeController',
+    'base table'       => 'mentions_type',
+    'fieldable'        => FALSE,
+    'bundle of'        => 'mention',
+    'exportable'       => TRUE,
+    'entity keys'      => array(
+      'id'    => 'id',
+      'name'  => 'type',
+      'label' => 'name',
+    ),
+    'module'           => 'mentions',
+    'admin ui'         => array(
+      'path'             => 'admin/structure/mentions',
+      'file'             => 'mentions.admin.inc',
+      'controller class' => 'MentionsTypeUIController',
+    ),
+    'access callback'  => 'mentions_type_access',
+  );
+
+  return $info;
+}
+
+/**
+ * Access callback for Mentions type entity.
+ *
+ * @return bool
+ */
+function mentions_type_access() {
+  return user_access('administer mention types');
+}
+
+/**
+ * URI callback for Mention entity.
+ *
+ * @param $mention
+ *
+ * @return array
+ */
+function mentions_uri($mention) {
+  return array(
+    'path' => $mention->source_path,
+  );
+}
+
+/**
+ * Loads a Mention type entity by name.
+ *
+ * @param $name
+ *
+ * @return bool
+ */
+function mentions_type_load($name) {
+  $mentions_types = db_select('mentions_type', 't')
+    ->fields('t', array())
+    ->condition('type', $name)
+    ->execute()
+    ->fetchAllAssoc('type');
+
+  if (isset($mentions_types[$name])) {
+    $mentions_types[$name]->input  = unserialize($mentions_types[$name]->input);
+    $mentions_types[$name]->output = unserialize($mentions_types[$name]->output);
+
+    return $mentions_types[$name];
+  }
+
+  return FALSE;
+}
+
+/**
+ * Saves a Mention type entity.
+ *
+ * @param $mention_type
+ */
+function mentions_type_save($mention_type) {
+  entity_save('mentions_type', $mention_type);
+}
+
+/**
+ * Returns Mention type defaults.
+ *
+ * @return object
+ */
+function mentions_type_set_defaults() {
+  return (object) array(
+    'type'        => '',
+    'name'        => '',
+    'plugin'      => '',
+    'description' => '',
+    'input'       => array(),
+    'output'      => array(),
+  );
+}
+
+/**
+ * Returns all Mention type plugins.
+ *
+ * @return mixed
+ */
+function mentions_get_plugins() {
+  ctools_include('plugins');
+  $plugins = ctools_get_plugins('mentions', 'mention_type');
+  foreach ($plugins as $plugin) {
+    if (isset($plugin['dependencies']) && is_array($plugin['dependencies'])) {
+      foreach ($plugin['dependencies'] as $module) {
+        if (!module_exists($module)) {
+          unset($plugins[$plugin['name']]);
+          break(2);
+        }
+      }
+    }
+  }
+
+  return $plugins;
+}
+
+/**
+ * Returns the specified Mention type plugin.
+ *
+ * @param $id
+ *
+ * @return bool
+ */
+function mentions_get_plugin($id) {
+  ctools_include('plugins');
+  $plugin = ctools_get_plugins('mentions', 'mention_type', $id);
+  if (isset($plugin['dependencies']) && is_array($plugin['dependencies'])) {
+    foreach ($plugin['dependencies'] as $module) {
+      if (!module_exists($module)) {
+        return FALSE;
+      }
+    }
+  }
+
+  return $plugin;
+}
+
+/**
+ * Implements hook_entity_insert().
+ *
+ * @param $entity
+ * @param $type
+ *
+ * @throws EntityMalformedException
+ */
+function mentions_entity_insert($entity, $type) {
+  if ($type == 'mention' || !empty($entity->mentions_skip)) {
+    return;
+  }
+
+  global $user;
+
+  $mentions = array();
+  list($id, , $bundle_name) = entity_extract_ids($type, $entity);
+  $instances     = field_info_instances($type, $bundle_name);
+  $mention_types = array_keys(field_info_bundles('mention'));
+
+  foreach ($instances as $instance) {
+    if ('text' == $instance['widget']['module'] && $instance['settings']['text_processing']) {
+      $items = field_get_items($type, $entity, $instance['field_name']);
+      if (is_array($items)) {
+        foreach ($items as $item) {
+          foreach ($mention_types as $mention_type) {
+            $item_mentions = mentions_get_mentions($item['value'], $mention_type);
+            foreach ($item_mentions as &$item_mention) {
+              $item_mention['source']['item'] = $item;
+            }
+            $mentions = array_merge($mentions, $item_mentions);
+          }
+        }
+      }
+    }
+  }
+
+  if (!empty($mentions)) {
+    foreach ($mentions as $mention) {
+      $uri          = entity_uri($type, $entity);
+      $mention_type = $mention['type'];
+      unset($mention['type']);
+
+      /** @var Mention $entity */
+      $mention_entity = entity_create('mention', array(
+        'type'         => $mention_type->type,
+        'source'       => "entity::{$type}::{$id}",
+        'source_title' => entity_label($type, $entity),
+        'source_path'  => isset($uri['path']) ? $uri['path'] : '',
+        'target'       => $mention['target']['id'],
+        'uid'          => $user->uid,
+        'created'      => REQUEST_TIME,
+        'changed'      => REQUEST_TIME,
+        'data'         => $mention,
+      ));
+      /** @var EntityDrupalWrapper $wrapper */
+      $wrapper = entity_metadata_wrapper('mention', $mention_entity);
+
+      $wrapper->mention_text = $mention['source']['item'];
+      $wrapper->save();
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ *
+ * @param $entity
+ * @param $type
+ */
+function mentions_entity_update($entity, $type) {
+  mentions_entity_insert($entity, $type);
+}
+
+/**
+ * Implements hook_entity_delete().
+ *
+ * @param $entity
+ * @param $type
+ */
+function mentions_entity_delete($entity, $type) {
+  /** @var EntityDrupalWrapper $wrapper */
+  $wrapper = entity_metadata_wrapper($type, $entity);
+  $query   = new EntityFieldQuery();
+  $results = $query->entityCondition('entity_type', 'mention')
+    ->propertyCondition('source', "entity::{$type}::{$wrapper->getIdentifier()}")
+    ->execute();
+  if (isset($results['mention']) && is_array($results['mention'])) {
+    entity_delete_multiple('mention', array_keys($results['mention']));
+  }
+}
+
+/**
+ * Replaces all mentions found of the specified type in the provided text.
+ *
+ * @param $text
+ * @param $mention_type
+ *
+ * @return bool
+ */
+function mentions_replace_mentions(&$text, $mention_type) {
+  $recursive = &drupal_static('__FUNCTION__', FALSE);
+  if (!$recursive) {
+    $recursive = TRUE;
+
+    if (is_string($mention_type)) {
+      $mention_type = mentions_type_load($mention_type);
+    }
+
+    if (!isset($mention_type->output) || (!isset($mention_type->plugin) || ($plugin = mentions_get_plugin($mention_type->plugin)) == FALSE)) {
+      return FALSE;
+    }
+
+    $mentions = mentions_get_mentions($text, $mention_type);
+    foreach ($mentions as $mention) {
+      $output = array(
+        'value' => isset($mention_type->output['value']) ? $mention_type->output['value'] : '',
+        'link'  => isset($mention_type->output['link']) ? $mention_type->output['link'] : '',
+      );
+      if (isset($plugin['callbacks']['output']) && function_exists($plugin['callbacks']['output'])) {
+        $output = $plugin['callbacks']['output']($mention, $mention_type->output);
+      }
+
+      $replacement = $output['value'];
+      if ($mention_type->output['render_link']) {
+        $replacement = l($replacement, $output['link']);
+      }
+
+      $replacement = str_replace($mention['source']['match'], $replacement, $mention['source']['string']);
+      $text        = str_replace($mention['source']['string'], $replacement, $text);
+    }
+
+    $recursive = FALSE;
+  }
+
+  return TRUE;
+}
+
+/**
+ * Returns all mentions found of the specified type in the provided text.
+ *
+ * @param $text
+ * @param $mention_type
+ *
+ * @return array
+ */
+function mentions_get_mentions($text, $mention_type) {
+  $mentions = array();
+  if (is_string($mention_type)) {
+    $mention_type = mentions_type_load($mention_type);
+  }
+
+  $input_pattern = mentions_get_input_pattern($mention_type);
+  if (preg_match_all($input_pattern, $text, $matches, PREG_SET_ORDER) && isset($mention_type->plugin)) {
+    $plugin = mentions_get_plugin($mention_type->plugin);
+    if (isset($plugin['callbacks']) && isset($plugin['callbacks']['target']) && function_exists($plugin['callbacks']['target'])) {
+      foreach ($matches as $match) {
+        if (($target = $plugin['callbacks']['target']($match[2], $mention_type)) !== FALSE) {
+          $mentions[$match[0]] = array(
+            'type'   => $mention_type,
+            'source' => array(
+              'string' => $match[0],
+              'match'  => $match[1],
+            ),
+            'target' => $target,
+          );
+        }
+      }
+    }
+  }
+
+  krsort($mentions);
+
+  return $mentions;
+}
+
+/**
+ * Returns the input pattern of a mention type, either as a regex or plain text.
+ *
+ * @param           $mention_type
+ * @param bool|TRUE $regex
+ *
+ * @return bool|string
+ */
+function mentions_get_input_pattern($mention_type, $regex = TRUE) {
+  if (is_string($mention_type)) {
+    $mention_type = mentions_type_load($mention_type);
+  }
+
+  if (!isset($mention_type->input)) {
+    return FALSE;
+  }
+
+  $pattern = '';
+
+  // Append prefix to pattern.
+  if (isset($mention_type->input['suffix'])) {
+    $pattern .= $regex ? preg_quote($mention_type->input['prefix'], '/') : $mention_type->input['prefix'];
+  }
+
+  // Append value to pattern.
+  if (!isset($mention_type->plugin) || ($plugin = mentions_get_plugin($mention_type->plugin)) == FALSE) {
+    return FALSE;
+  }
+  if (isset($plugin['callbacks']['pattern']) && function_exists($plugin['callbacks']['pattern'])) {
+    $input = $plugin['callbacks']['pattern']($mention_type->input, $regex);
+    $pattern .= $regex ? "({$input})" : drupal_strtoupper($input);
+  }
+
+  // Append suffix to pattern.
+  if (isset($mention_type->input['suffix'])) {
+    $pattern .= $regex ? preg_quote($mention_type->input['suffix'], '/') : $mention_type->input['suffix'];
+  }
+
+  $pattern = $regex ? '/(?:^|\s)(' . $pattern . ')(?:$|\W)/m' : $pattern;
+
+  return $pattern;
+}

@@ -1,0 +1,25 @@
+name = Mentions
+description = Record, render and react to specified patterns within content.
+core = 7.x
+configure = admin/structure/mentions
+dependencies[] = ctools
+dependencies[] = entity
+
+
+
+; Files - Entity controller
+
+files[] = mentions.controller.inc
+
+
+
+; Files - Tests
+
+files[] = tests/mentions.test
+
+; Information added by Drupal.org packaging script on 2015-10-11
+version = "7.x-2.x-dev"
+core = "7.x"
+project = "mentions"
+datestamp = "1444601342"
+
